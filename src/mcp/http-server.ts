@@ -115,14 +115,18 @@ const transportRegistry = new TransportRegistry<StreamableHTTPServerTransport>(
 )
 transportRegistry.start()
 
+const sessionNotFound = (res: any) =>
+  res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null })
+
 const mcpPostHandler = async (req: any, res: any) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined
 
   try {
     let transport: StreamableHTTPServerTransport
 
-    if (sessionId && transportRegistry.get(sessionId)) {
-      transport = transportRegistry.get(sessionId)!
+    const existing = sessionId ? transportRegistry.get(sessionId) : undefined
+    if (sessionId && existing) {
+      transport = existing
       transportRegistry.touch(sessionId)
     } else if (!sessionId && isInitializeRequest(req.body)) {
       transport = new StreamableHTTPServerTransport({
@@ -143,6 +147,9 @@ const mcpPostHandler = async (req: any, res: any) => {
       const server = getServer()
       await server.connect(transport)
       await transport.handleRequest(req, res, req.body)
+      return
+    } else if (sessionId) {
+      sessionNotFound(res)
       return
     } else {
       res.status(400).json({
@@ -168,23 +175,33 @@ const mcpPostHandler = async (req: any, res: any) => {
 
 const mcpGetHandler = async (req: any, res: any) => {
   const sessionId = req.headers['mcp-session-id'] as string
-  if (!sessionId || !transportRegistry.get(sessionId)) {
+  if (!sessionId) {
     res.status(400).send('Invalid or missing session ID')
     return
   }
+  const transport = transportRegistry.get(sessionId)
+  if (!transport) {
+    sessionNotFound(res)
+    return
+  }
   transportRegistry.touch(sessionId)
-  await transportRegistry.get(sessionId)!.handleRequest(req, res)
+  await transport.handleRequest(req, res)
 }
 
 const mcpDeleteHandler = async (req: any, res: any) => {
   const sessionId = req.headers['mcp-session-id'] as string
-  if (!sessionId || !transportRegistry.get(sessionId)) {
+  if (!sessionId) {
     res.status(400).send('Invalid or missing session ID')
+    return
+  }
+  const transport = transportRegistry.get(sessionId)
+  if (!transport) {
+    sessionNotFound(res)
     return
   }
   try {
     transportRegistry.touch(sessionId)
-    await transportRegistry.get(sessionId)!.handleRequest(req, res)
+    await transport.handleRequest(req, res)
   } catch (error) {
     console.error('[MCP HTTP] Error handling session termination:', error)
     if (!res.headersSent) res.status(500).send('Error processing session termination')

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { TransportRegistry, type ClosableTransport } from './transport-registry.js'
+import { TransportRegistry } from './transport-registry.js'
 
-const transport = (close = vi.fn().mockResolvedValue(undefined)): ClosableTransport & { close: typeof close } => ({ close })
+type ClosableTransport = { close: () => Promise<void> }
+
+const transport = (close = vi.fn().mockResolvedValue(undefined)) => ({ close })
 
 describe('TransportRegistry', () => {
   afterEach(() => {

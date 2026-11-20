@@ -1,4 +1,4 @@
-export interface ClosableTransport {
+interface ClosableTransport {
   close: () => Promise<void> | void
 }
 
