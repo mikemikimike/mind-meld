@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import {
   isRecoverableEmbedError,
   isOversizeEmbedError,
@@ -210,6 +212,55 @@ describe("the interactive client", () => {
     caller.abort(new Error("search-abandoned-wren"));
     await expect(search).rejects.toThrow("search-abandoned-wren");
     await expect(background).resolves.toMatchObject({ embeddings: [[0.5]] });
+  });
+
+  // A search abandoned while it queued for the slot must not then spend that
+  // slot. fetch refuses a signal that is already aborted without sending.
+  it("fails at once, with the caller's reason, when the caller gave up before it was sent", async () => {
+    const sent: AbortSignal[] = [];
+    vi.stubGlobal("fetch", (_input: unknown, init: RequestInit) => {
+      sent.push(init.signal!);
+      return init.signal!.aborted
+        ? Promise.reject(init.signal!.reason)
+        : new Promise((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason)));
+    });
+    const caller = new AbortController();
+    caller.abort(new Error("search-abandoned-tern"));
+    await expect(getInteractiveOllamaClient(caller.signal).embed({ model: "m", input: "q" })).rejects.toThrow(
+      "search-abandoned-tern",
+    );
+    expect(sent.map((signal) => signal.aborted)).toEqual([true]);
+  });
+
+  // On Node 20, the runtime the image ships (Dockerfile.http), a deadline built
+  // as AbortSignal.any([cancel, AbortSignal.timeout(ms)]) holds the timeout only
+  // weakly: the first GC collects it and the deadline never fires. On
+  // 2026-11-20 one query embedding waited 105 s on a cold-loading model instead
+  // of giving up at 8 s. Node 22 keeps the timeout alive, so the broken version
+  // fails this only on Node 20.
+  it("gives up at its deadline even when the process collects garbage while it waits", async () => {
+    setFlagsFromString("--expose-gc");
+    const collectGarbage = runInNewContext("gc") as () => void;
+    const ollama = config.ollama as { interactiveTimeoutMs: number };
+    const saved = ollama.interactiveTimeoutMs;
+    ollama.interactiveTimeoutMs = 200;
+    vi.stubGlobal("fetch", (_input: unknown, init: RequestInit) =>
+      new Promise((_resolve, reject) =>
+        init.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+      ),
+    );
+    const collector = setInterval(collectGarbage, 20);
+    try {
+      const embedding = getInteractiveOllamaClient(new AbortController().signal).embed({ model: "m", input: "q" });
+      const outcome = await Promise.race([
+        embedding.then(() => "answered", (error: Error) => error.name),
+        new Promise((resolve) => setTimeout(resolve, 2_000, "still waiting at 2 s")),
+      ]);
+      expect(outcome).toBe("TimeoutError");
+    } finally {
+      clearInterval(collector);
+      ollama.interactiveTimeoutMs = saved;
+    }
   });
 });
 

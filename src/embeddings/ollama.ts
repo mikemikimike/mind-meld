@@ -134,12 +134,21 @@ const fetchOnce = (cancel: AbortSignal): typeof fetch => async (input, init) => 
   const headers = new Headers(init?.headers);
   headers.set(GATE_OVERRIDE_HEADER, "interactive");
   return withOllamaGate(
-    () =>
-      fetch(input, {
-        ...init,
-        headers,
-        signal: AbortSignal.any([cancel, AbortSignal.timeout(interactiveTimeoutMs)]),
-      }),
+    () => {
+      // Not AbortSignal.any([cancel, AbortSignal.timeout(ms)]): on Node 20 it
+      // holds the timeout only weakly, a GC collects it, and the deadline never
+      // fires (one query embedding ran 105 s against an 8 s budget). The timer
+      // closure holds this controller strongly. The timer is not cleared once
+      // fetch resolves, so reading the body stays inside the deadline too.
+      const deadline = new AbortController();
+      setTimeout(
+        () => deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")),
+        interactiveTimeoutMs,
+      ).unref();
+      if (cancel.aborted) deadline.abort(cancel.reason);
+      else cancel.addEventListener("abort", () => deadline.abort(cancel.reason), { once: true });
+      return fetch(input, { ...init, headers, signal: deadline.signal });
+    },
     interactiveTimeoutMs,
   );
 };
