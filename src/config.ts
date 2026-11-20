@@ -256,6 +256,13 @@ export const config = {
     model: getEnv("EMBEDDING_MODEL", "bge-m3"),
     dimensions: getEnvInt("EMBEDDING_DIMENSIONS", 1024),
     batchSize: getEnvInt("EMBEDDING_BATCH_SIZE", 100),
+    // Sent as options.num_batch on every bge-m3 request. bge-m3 reads 8192
+    // tokens, but Ollama 0.40 starts its runner with a 2048-token batch and
+    // refuses anything longer with the same 413 "exceeds the context length" it
+    // uses for a real overflow. Deliberately not an env var: Ollama restarts the
+    // runner whenever two requests ask for different batches, so every caller in
+    // every container must send this one value.
+    numBatch: 8192,
     // The one default. docker-compose.yml repeats the literal because compose
     // cannot read it from here — keep them in step, and prefer changing this one
     // first. An -instruct build is required: a `thinking` model emits its

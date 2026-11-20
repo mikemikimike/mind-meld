@@ -181,7 +181,12 @@ export function getInteractiveOllamaClient(cancel: AbortSignal): Ollama {
 // a prefix, with no error and no record that it happened. Measured 2026-07-28: 64% of
 // 5-8k-char messages and 100% of session summaries over ~22k chars were being clipped
 // this way. Refusing lets the caller summarize instead, which loses far less.
-const NO_TRUNCATE = { truncate: false, keep_alive: "30m" } as const;
+// num_batch makes the window really 8192: see config.embeddings.numBatch.
+const NO_TRUNCATE = {
+  truncate: false,
+  keep_alive: "30m",
+  options: { num_batch: config.embeddings.numBatch },
+} as const;
 
 // Sanitize text for embedding - remove problematic characters
 function sanitizeText(text: string): string {

@@ -225,6 +225,8 @@ const getQueryEmbedding = async (text: string, signal: AbortSignal) => {
   const response = await getInteractiveOllamaClient(signal).embed({
     model: config.embeddings.model,
     input: text,
+    // The backfill's batch, or Ollama restarts the runner between them.
+    options: { num_batch: config.embeddings.numBatch },
   })
   return response.embeddings[0]
 }

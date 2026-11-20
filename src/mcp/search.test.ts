@@ -1279,3 +1279,14 @@ describe('recency is last activity, not first message', () => {
     expect(sql).not.toContain('s.started_at >= $3')
   })
 })
+
+// Ollama restarts bge-m3's runner whenever a request asks for a different
+// batch than the one it runs with, so a query must ask for the backfill's.
+describe('the query embedding', () => {
+  it("asks for the batch that covers bge-m3's 8192-token window, like the backfill", async () => {
+    mockDbForSemantic()
+    mockChromaSessionsOnly()
+    await searchWithDiagnostics({ query: 'build', mode: 'semantic' })
+    expect(embed).toHaveBeenCalledWith(expect.objectContaining({ options: { num_batch: 8192 } }))
+  })
+})
