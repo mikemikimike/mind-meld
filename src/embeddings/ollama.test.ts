@@ -6,8 +6,14 @@ import {
   retryAfterMs,
   getInteractiveOllamaClient,
   getOllamaClient,
+  generateEmbeddings,
+  ensureEmbeddingModel,
 } from "./ollama.js";
 import { config } from "../config.js";
+
+// The summarizer is a qwen3 call; tests here only need to know it was asked.
+const shrink = vi.hoisted(() => vi.fn<(text: string) => Promise<string>>());
+vi.mock("./summarize.js", () => ({ shrinkBySummarizing: shrink, SUMMARIZE_MODEL: "qwen3" }));
 
 // Oversize and NaN are both recoverable but need opposite rewrites — summarize to
 // shed tokens vs. rephrase to change wording at the same length. Confusing the two
@@ -245,5 +251,114 @@ describe("the background client", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(getOllamaClient().embed({ model: "m", input: "summary" })).resolves.toMatchObject({ embeddings: [[0.5]] });
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up on a connection that stays down once its retries are spent", async () => {
+    const fetch = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
+    vi.stubGlobal("fetch", fetch);
+    await expect(getOllamaClient().list()).rejects.toThrow("fetch failed");
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("pulls the embedding model at startup only when Ollama lacks it", async () => {
+    let models = [{ name: "qwen3:4b-instruct" }];
+    const fetch = vi.fn(async (input: string) =>
+      input.endsWith("/api/tags") ? Response.json({ models }) : Response.json({ status: "success" }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await ensureEmbeddingModel();
+    models = [{ name: `${config.embeddings.model}:latest` }];
+    await ensureEmbeddingModel();
+    expect(fetch.mock.calls.map(([url]) => new URL(url).pathname)).toEqual(["/api/tags", "/api/pull", "/api/tags"]);
+  });
+
+  it("surfaces an unreachable Ollama at startup", async () => {
+    vi.stubGlobal("fetch", () => Promise.reject(new TypeError("fetch failed")));
+    await expect(ensureEmbeddingModel()).rejects.toThrow("fetch failed");
+  });
+});
+
+// One refused text must cost one vector, never the batch or the queue: the queue is
+// ordered by id and never skips, so a throw here stalls every message behind it.
+describe("embedding a batch bge-m3 refuses part of", () => {
+  // Every request this test saw, and the answer to give each text on its own.
+  let requests: { url: string; input?: string[]; options?: { num_batch?: number } }[];
+  let answer: (text: string) => Response;
+  const ok = () => Response.json({ model: "m", embeddings: [[0.5]] });
+  const oversize = () => Response.json({ error: "the input length exceeds the context length" }, { status: 413 });
+  // Requests for this text on its own, after the batch holding it was refused.
+  const alone = (match: (text: string) => boolean) =>
+    requests.filter((r) => r.input?.length === 1 && match(r.input[0])).length;
+
+  beforeEach(() => {
+    requests = [];
+    answer = ok;
+    shrink.mockReset();
+    shrink.mockImplementation(async (text: string) => text.slice(0, -1));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("fetch", async (input: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      requests.push({ url: String(input), ...body });
+      // The rephraser, for texts whose vector came back NaN.
+      if (String(input).endsWith("/api/generate")) return Response.json({ response: "plain words" });
+      // Any batch of two or more holds the refused text, so it fails whole.
+      if (body.input.length > 1) return oversize();
+      return answer(body.input[0]);
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // Ollama 0.40 runs bge-m3 with a 2048-token batch and refuses longer input with
+  // the same 413 as a real overflow, though the model reads 8192. Every request
+  // must ask for the full window, and all must ask alike: Ollama restarts the
+  // runner whenever the batch changes.
+  it("asks for a batch covering the 8192-token window, in the batch and one by one", async () => {
+    await generateEmbeddings(["one", "two"]);
+    expect(requests.map((r) => r.options?.num_batch)).toEqual([8192, 8192, 8192]);
+  });
+
+  it("embeds the rest and gives up on a text that never fits after three rewrites", async () => {
+    answer = (text) => (text.startsWith("poison") ? oversize() : ok());
+    await expect(generateEmbeddings(["poison-pill-text", "fine"])).resolves.toEqual([null, [0.5]]);
+    expect(shrink).toHaveBeenCalledTimes(3);
+    expect(alone((text) => text.startsWith("poison"))).toBe(4);
+  });
+
+  it("embeds a text once a summary brings it inside the window", async () => {
+    shrink.mockResolvedValue("short");
+    answer = (text) => (text === "too long" ? oversize() : ok());
+    await expect(generateEmbeddings(["too long", "fine"])).resolves.toEqual([[0.5], [0.5]]);
+    expect(alone((text) => text === "short")).toBe(1);
+  });
+
+  it("gives up on a text the summarizer refuses to rewrite", async () => {
+    shrink.mockRejectedValue(new Error("summary-refused-grebe"));
+    answer = (text) => (text === "too long" ? oversize() : ok());
+    await expect(generateEmbeddings(["too long", "fine"])).resolves.toEqual([null, [0.5]]);
+    expect(alone((text) => text === "too long")).toBe(1);
+  });
+
+  it("rephrases, not summarizes, a text whose vector is not finite", async () => {
+    answer = (text) =>
+      text === "odd words" ? new Response('{"model":"m","embeddings":[[1e999]]}') : ok();
+    await expect(generateEmbeddings(["odd words", "fine"])).resolves.toEqual([[0.5], [0.5]]);
+    expect(shrink).not.toHaveBeenCalled();
+    expect(alone((text) => text === "plain words")).toBe(1);
+  });
+
+  // Rewriting cannot fix a missing model or a dead tunnel; it must surface.
+  it("fails the batch on an error no rewrite can fix", async () => {
+    answer = () => Response.json({ error: 'model "bge-m3" not found' }, { status: 404 });
+    await expect(generateEmbeddings(["one", "two"])).rejects.toThrow("not found");
+    vi.stubGlobal("fetch", async () => Response.json({ error: 'model "bge-m3" not found' }, { status: 404 }));
+    await expect(generateEmbeddings(["one", "two"])).rejects.toThrow("not found");
+  });
+
+  it("refuses a text that is empty once cleaned", async () => {
+    await expect(generateEmbeddings(["fine", "\u0000"])).rejects.toThrow("index 1 is empty");
   });
 });

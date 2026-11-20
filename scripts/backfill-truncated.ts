@@ -79,6 +79,7 @@ const wasClipped = async (text: string) => {
       input: [text],
       truncate: false,
       keep_alive: "30m",
+      options: { num_batch: config.embeddings.numBatch },
     });
     return false;
   } catch (error: any) {
