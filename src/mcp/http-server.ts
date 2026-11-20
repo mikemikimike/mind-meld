@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
@@ -6,9 +5,8 @@ import { listProjects, listSessions, getActivity } from './browse.js'
 import { toSearchResponse, toDigest, toMessages, toMessage, parseSearchShape } from './rest.js'
 import { STATS_WINDOWS, usageStats } from './usage-stats.js'
 import { listQuarantine, replayQuarantine, countPending } from '../sync/quarantine.js'
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { hostHeaderValidation } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js'
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { query, closePool } from '../db/postgres.js'
 import { runMigrations } from '../db/migrations.js'
@@ -49,6 +47,7 @@ import { ensureSummarizeModel } from '../embeddings/summarize.js'
 import { createRequire } from 'node:module'
 import { resolveTitle } from './title.js'
 import { TransportRegistry } from './transport-registry.js'
+import { mcpSessionHandlers } from './mcp-sessions.js'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../../package.json')
@@ -114,103 +113,10 @@ const transportRegistry = new TransportRegistry<StreamableHTTPServerTransport>(
   (sessionId, error) => console.error(`[MCP HTTP] Error closing idle transport ${sessionId}:`, error),
 )
 transportRegistry.start()
-
-const sessionNotFound = (res: any) =>
-  res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null })
-
-const mcpPostHandler = async (req: any, res: any) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined
-
-  try {
-    let transport: StreamableHTTPServerTransport
-
-    const existing = sessionId ? transportRegistry.get(sessionId) : undefined
-    if (sessionId && existing) {
-      transport = existing
-      transportRegistry.touch(sessionId)
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => {
-          transportRegistry.set(id, transport)
-        },
-        onsessionclosed: (id) => {
-          transportRegistry.delete(id)
-        }
-      })
-
-      transport.onclose = () => {
-        const sid = transport.sessionId
-        if (sid) transportRegistry.delete(sid)
-      }
-
-      const server = getServer()
-      await server.connect(transport)
-      await transport.handleRequest(req, res, req.body)
-      return
-    } else if (sessionId) {
-      sessionNotFound(res)
-      return
-    } else {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-        id: null
-      })
-      return
-    }
-
-    await transport.handleRequest(req, res, req.body)
-  } catch (error) {
-    console.error('[MCP HTTP] Error handling request:', error)
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null
-      })
-    }
-  }
-}
-
-const mcpGetHandler = async (req: any, res: any) => {
-  const sessionId = req.headers['mcp-session-id'] as string
-  if (!sessionId) {
-    res.status(400).send('Invalid or missing session ID')
-    return
-  }
-  const transport = transportRegistry.get(sessionId)
-  if (!transport) {
-    sessionNotFound(res)
-    return
-  }
-  transportRegistry.touch(sessionId)
-  await transport.handleRequest(req, res)
-}
-
-const mcpDeleteHandler = async (req: any, res: any) => {
-  const sessionId = req.headers['mcp-session-id'] as string
-  if (!sessionId) {
-    res.status(400).send('Invalid or missing session ID')
-    return
-  }
-  const transport = transportRegistry.get(sessionId)
-  if (!transport) {
-    sessionNotFound(res)
-    return
-  }
-  try {
-    transportRegistry.touch(sessionId)
-    await transport.handleRequest(req, res)
-  } catch (error) {
-    console.error('[MCP HTTP] Error handling session termination:', error)
-    if (!res.headersSent) res.status(500).send('Error processing session termination')
-  }
-}
-
-app.post('/mcp', mcpPostHandler)
-app.get('/mcp', mcpGetHandler)
-app.delete('/mcp', mcpDeleteHandler)
+const mcp = mcpSessionHandlers(transportRegistry, getServer)
+app.post('/mcp', mcp.post)
+app.get('/mcp', mcp.get)
+app.delete('/mcp', mcp.delete)
 
 app.get('/health', (req: any, res: any) => {
   res.json({ status: 'ok', name: 'mindmeld', version })
