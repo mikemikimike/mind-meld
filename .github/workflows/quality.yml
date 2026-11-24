@@ -107,3 +107,31 @@ jobs:
 
       - name: Coverage ratchet (fails only on regression or stale baseline)
         run: pnpm run quality:coverage
+
+  # The images run Node 20 (Dockerfile.http, Dockerfile.ui: node:20-alpine); the
+  # job above runs 22. Some bugs exist only on 20: AbortSignal.any() lets a GC
+  # collect the AbortSignal.timeout() inside it, so a deadline never fires (the
+  # garbage-collection test in src/embeddings/ollama.test.ts). That test passes
+  # on 22 whatever the code does, so it guards only here.
+  production-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Tests on the production runtime
+        run: pnpm test

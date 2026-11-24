@@ -38,6 +38,31 @@ Every machine reaches a single Ollama through `OLLAMA_URL` (default
 >   | head -c 80   # expect a long non-null "embeddings":[[...]] array
 > ```
 
+### The second trap: one bge-m3 runner, one batch size
+
+Every embed mindmeld sends asks for `num_batch: 8192`, so bge-m3 reads its whole
+8192-token window. Ollama runs one runner per model file and restarts it when a
+request asks for a different `num_batch`, but **only once the loaded runner is
+idle**. Any client that sends default options (an older mindmeld on another
+machine, a script, `curl`) loads a runner with a 2048 batch, and while it keeps
+that runner busy, every mindmeld embed waits: the backfill until
+`OLLAMA_TIMEOUT_MS`, and search query embeddings until their 8 s deadline, so
+every search comes back full-text only.
+
+Pin the batch on the model itself, once, on the Ollama host. A request with no
+`num_batch` then resolves to the same runner:
+
+```bash
+printf 'FROM bge-m3:latest\nPARAMETER num_batch 8192\n' > bge-m3.Modelfile
+ollama create bge-m3 -f bge-m3.Modelfile
+curl -s localhost:11434/api/show -d '{"model":"bge-m3"}' | grep -o 'num_batch *[0-9]*'
+```
+
+The `health` tool reports this as **Embedding Batch** (HEALTHY, UNHEALTHY or
+UNKNOWN), and every sync warns at startup while it is unpinned. Re-run the
+`ollama create` after any `ollama pull bge-m3`, because a pull replaces the
+manifest.
+
 Mindmeld used to split this across two instances, with vectorization on `:21434`
 via `OLLAMA_EMBEDDING_URL`. That variable was **removed** — if an old `.env`,
 compose file, or systemd unit still sets it, it is silently ignored, and the

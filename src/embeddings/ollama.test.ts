@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import {
   isRecoverableEmbedError,
   isOversizeEmbedError,
@@ -6,8 +8,15 @@ import {
   retryAfterMs,
   getInteractiveOllamaClient,
   getOllamaClient,
+  generateEmbeddings,
+  ensureEmbeddingModel,
+  embeddingModelBatch,
 } from "./ollama.js";
 import { config } from "../config.js";
+
+// The summarizer is a qwen3 call; tests here only need to know it was asked.
+const shrink = vi.hoisted(() => vi.fn<(text: string) => Promise<string>>());
+vi.mock("./summarize.js", () => ({ shrinkBySummarizing: shrink, SUMMARIZE_MODEL: "qwen3" }));
 
 // Oversize and NaN are both recoverable but need opposite rewrites — summarize to
 // shed tokens vs. rephrase to change wording at the same length. Confusing the two
@@ -205,6 +214,55 @@ describe("the interactive client", () => {
     await expect(search).rejects.toThrow("search-abandoned-wren");
     await expect(background).resolves.toMatchObject({ embeddings: [[0.5]] });
   });
+
+  // A search abandoned while it queued for the slot must not then spend that
+  // slot. fetch refuses a signal that is already aborted without sending.
+  it("fails at once, with the caller's reason, when the caller gave up before it was sent", async () => {
+    const sent: AbortSignal[] = [];
+    vi.stubGlobal("fetch", (_input: unknown, init: RequestInit) => {
+      sent.push(init.signal!);
+      return init.signal!.aborted
+        ? Promise.reject(init.signal!.reason)
+        : new Promise((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason)));
+    });
+    const caller = new AbortController();
+    caller.abort(new Error("search-abandoned-tern"));
+    await expect(getInteractiveOllamaClient(caller.signal).embed({ model: "m", input: "q" })).rejects.toThrow(
+      "search-abandoned-tern",
+    );
+    expect(sent.map((signal) => signal.aborted)).toEqual([true]);
+  });
+
+  // On Node 20, the runtime the image ships (Dockerfile.http), a deadline built
+  // as AbortSignal.any([cancel, AbortSignal.timeout(ms)]) holds the timeout only
+  // weakly: the first GC collects it and the deadline never fires. On
+  // 2026-11-20 one query embedding waited 105 s on a cold-loading model instead
+  // of giving up at 8 s. Node 22 keeps the timeout alive, so the broken version
+  // fails this only on Node 20.
+  it("gives up at its deadline even when the process collects garbage while it waits", async () => {
+    setFlagsFromString("--expose-gc");
+    const collectGarbage = runInNewContext("gc") as () => void;
+    const ollama = config.ollama as { interactiveTimeoutMs: number };
+    const saved = ollama.interactiveTimeoutMs;
+    ollama.interactiveTimeoutMs = 200;
+    vi.stubGlobal("fetch", (_input: unknown, init: RequestInit) =>
+      new Promise((_resolve, reject) =>
+        init.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+      ),
+    );
+    const collector = setInterval(collectGarbage, 20);
+    try {
+      const embedding = getInteractiveOllamaClient(new AbortController().signal).embed({ model: "m", input: "q" });
+      const outcome = await Promise.race([
+        embedding.then(() => "answered", (error: Error) => error.name),
+        new Promise((resolve) => setTimeout(resolve, 2_000, "still waiting at 2 s")),
+      ]);
+      expect(outcome).toBe("TimeoutError");
+    } finally {
+      clearInterval(collector);
+      ollama.interactiveTimeoutMs = saved;
+    }
+  });
 });
 
 // The GPU gate answers 503 while a game holds the card. Background work must
@@ -245,5 +303,181 @@ describe("the background client", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(getOllamaClient().embed({ model: "m", input: "summary" })).resolves.toMatchObject({ embeddings: [[0.5]] });
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up on a connection that stays down once its retries are spent", async () => {
+    const fetch = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
+    vi.stubGlobal("fetch", fetch);
+    await expect(getOllamaClient().list()).rejects.toThrow("fetch failed");
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("pulls the embedding model at startup only when Ollama lacks it", async () => {
+    let models = [{ name: "qwen3:4b-instruct" }];
+    const fetch = vi.fn(async (input: string) =>
+      input.endsWith("/api/tags") ? Response.json({ models }) : Response.json({ status: "success" }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    await ensureEmbeddingModel();
+    models = [{ name: `${config.embeddings.model}:latest` }];
+    await ensureEmbeddingModel();
+    expect(fetch.mock.calls.map(([url]) => new URL(url).pathname)).toEqual([
+      "/api/tags", "/api/pull", "/api/show",
+      "/api/tags", "/api/show",
+    ]);
+  });
+
+  // #245: the warning names the condition that starves mindmeld's embeds.
+  it("warns at startup when the model does not pin mindmeld's batch, and only then", async () => {
+    let parameters = "num_ctx 8192";
+    vi.stubGlobal("fetch", async (input: string) =>
+      input.endsWith("/api/tags")
+        ? Response.json({ models: [{ name: `${config.embeddings.model}:latest` }] })
+        : Response.json({ parameters }),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await ensureEmbeddingModel();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain(`PARAMETER num_batch ${config.embeddings.numBatch}`);
+      parameters = `num_batch ${config.embeddings.numBatch}`;
+      await ensureEmbeddingModel();
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("surfaces an unreachable Ollama at startup", async () => {
+    vi.stubGlobal("fetch", () => Promise.reject(new TypeError("fetch failed")));
+    await expect(ensureEmbeddingModel()).rejects.toThrow("fetch failed");
+  });
+});
+
+// One refused text must cost one vector, never the batch or the queue: the queue is
+// ordered by id and never skips, so a throw here stalls every message behind it.
+describe("embedding a batch bge-m3 refuses part of", () => {
+  // Every request this test saw, and the answer to give each text on its own.
+  let requests: { url: string; input?: string[]; options?: { num_batch?: number } }[];
+  let answer: (text: string) => Response;
+  const ok = () => Response.json({ model: "m", embeddings: [[0.5]] });
+  const oversize = () => Response.json({ error: "the input length exceeds the context length" }, { status: 413 });
+  // Requests for this text on its own, after the batch holding it was refused.
+  const alone = (match: (text: string) => boolean) =>
+    requests.filter((r) => r.input?.length === 1 && match(r.input[0])).length;
+
+  beforeEach(() => {
+    requests = [];
+    answer = ok;
+    shrink.mockReset();
+    shrink.mockImplementation(async (text: string) => text.slice(0, -1));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("fetch", async (input: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      requests.push({ url: String(input), ...body });
+      // The rephraser, for texts whose vector came back NaN.
+      if (String(input).endsWith("/api/generate")) return Response.json({ response: "plain words" });
+      // Any batch of two or more holds the refused text, so it fails whole.
+      if (body.input.length > 1) return oversize();
+      return answer(body.input[0]);
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // Ollama 0.40 runs bge-m3 with a 2048-token batch and refuses longer input with
+  // the same 413 as a real overflow, though the model reads 8192. Every request
+  // must ask for the full window, and all must ask alike: Ollama restarts the
+  // runner whenever the batch changes.
+  it("asks for a batch covering the 8192-token window, in the batch and one by one", async () => {
+    await generateEmbeddings(["one", "two"]);
+    expect(requests.map((r) => r.options?.num_batch)).toEqual([8192, 8192, 8192]);
+  });
+
+  it("embeds the rest and gives up on a text that never fits after three rewrites", async () => {
+    answer = (text) => (text.startsWith("poison") ? oversize() : ok());
+    await expect(generateEmbeddings(["poison-pill-text", "fine"])).resolves.toEqual([null, [0.5]]);
+    expect(shrink).toHaveBeenCalledTimes(3);
+    expect(alone((text) => text.startsWith("poison"))).toBe(4);
+  });
+
+  it("embeds a text once a summary brings it inside the window", async () => {
+    shrink.mockResolvedValue("short");
+    answer = (text) => (text === "too long" ? oversize() : ok());
+    await expect(generateEmbeddings(["too long", "fine"])).resolves.toEqual([[0.5], [0.5]]);
+    expect(alone((text) => text === "short")).toBe(1);
+  });
+
+  it("gives up on a text the summarizer refuses to rewrite", async () => {
+    shrink.mockRejectedValue(new Error("summary-refused-grebe"));
+    answer = (text) => (text === "too long" ? oversize() : ok());
+    await expect(generateEmbeddings(["too long", "fine"])).resolves.toEqual([null, [0.5]]);
+    expect(alone((text) => text === "too long")).toBe(1);
+  });
+
+  it("rephrases, not summarizes, a text whose vector is not finite", async () => {
+    answer = (text) =>
+      text === "odd words" ? new Response('{"model":"m","embeddings":[[1e999]]}') : ok();
+    await expect(generateEmbeddings(["odd words", "fine"])).resolves.toEqual([[0.5], [0.5]]);
+    expect(shrink).not.toHaveBeenCalled();
+    expect(alone((text) => text === "plain words")).toBe(1);
+  });
+
+  // Rewriting cannot fix a missing model or a dead tunnel; it must surface.
+  it("fails the batch on an error no rewrite can fix", async () => {
+    answer = () => Response.json({ error: 'model "bge-m3" not found' }, { status: 404 });
+    await expect(generateEmbeddings(["one", "two"])).rejects.toThrow("not found");
+    vi.stubGlobal("fetch", async () => Response.json({ error: 'model "bge-m3" not found' }, { status: 404 }));
+    await expect(generateEmbeddings(["one", "two"])).rejects.toThrow("not found");
+  });
+
+  it("refuses a text that is empty once cleaned", async () => {
+    await expect(generateEmbeddings(["fine", "\u0000"])).rejects.toThrow("index 1 is empty");
+  });
+});
+
+// Ollama keeps one runner per model file and restarts it for a request that asks
+// for another num_batch, but only once the loaded runner is idle. So a client that
+// sends default options while it keeps bge-m3 busy starves every request that asks
+// for config.embeddings.numBatch, query embeddings included (#245). The model's own
+// num_batch parameter is what a default request resolves to, so it decides whether
+// every client lands on one runner.
+describe("embeddingModelBatch", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const showReturns = (body: object, status = 200) => {
+    const asked: { url: string; body: unknown }[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit) => {
+      asked.push({ url: String(input), body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify(body), { status });
+    });
+    return asked;
+  };
+
+  it("reads the num_batch the model pins from /api/show", async () => {
+    const asked = showReturns({ parameters: "num_ctx                        8192\nnum_batch                      8192" });
+    await expect(embeddingModelBatch()).resolves.toBe(8192);
+    expect(asked[0].url).toBe(`${config.ollama.url}/api/show`);
+    expect(asked[0].body).toEqual({ model: config.embeddings.model });
+  });
+
+  it("is null when the model pins parameters but not num_batch", async () => {
+    showReturns({ parameters: "num_ctx                        8192" });
+    await expect(embeddingModelBatch()).resolves.toBeNull();
+  });
+
+  it("is null when the model pins no parameters at all, as a plain pull does", async () => {
+    showReturns({ modelfile: "FROM bge-m3" });
+    await expect(embeddingModelBatch()).resolves.toBeNull();
+  });
+
+  it("fails when Ollama does not know the model", async () => {
+    showReturns({ error: "model 'bge-m3' not found" }, 404);
+    await expect(embeddingModelBatch()).rejects.toThrow("404");
   });
 });

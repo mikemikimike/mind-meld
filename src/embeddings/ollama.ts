@@ -134,12 +134,21 @@ const fetchOnce = (cancel: AbortSignal): typeof fetch => async (input, init) => 
   const headers = new Headers(init?.headers);
   headers.set(GATE_OVERRIDE_HEADER, "interactive");
   return withOllamaGate(
-    () =>
-      fetch(input, {
-        ...init,
-        headers,
-        signal: AbortSignal.any([cancel, AbortSignal.timeout(interactiveTimeoutMs)]),
-      }),
+    () => {
+      // Not AbortSignal.any([cancel, AbortSignal.timeout(ms)]): on Node 20 it
+      // holds the timeout only weakly, a GC collects it, and the deadline never
+      // fires (one query embedding ran 105 s against an 8 s budget). The timer
+      // closure holds this controller strongly. The timer is not cleared once
+      // fetch resolves, so reading the body stays inside the deadline too.
+      const deadline = new AbortController();
+      setTimeout(
+        () => deadline.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")),
+        interactiveTimeoutMs,
+      ).unref();
+      if (cancel.aborted) deadline.abort(cancel.reason);
+      else cancel.addEventListener("abort", () => deadline.abort(cancel.reason), { once: true });
+      return fetch(input, { ...init, headers, signal: deadline.signal });
+    },
     interactiveTimeoutMs,
   );
 };
@@ -172,7 +181,12 @@ export function getInteractiveOllamaClient(cancel: AbortSignal): Ollama {
 // a prefix, with no error and no record that it happened. Measured 2026-07-28: 64% of
 // 5-8k-char messages and 100% of session summaries over ~22k chars were being clipped
 // this way. Refusing lets the caller summarize instead, which loses far less.
-const NO_TRUNCATE = { truncate: false, keep_alive: "30m" } as const;
+// num_batch makes the window really 8192: see config.embeddings.numBatch.
+const NO_TRUNCATE = {
+  truncate: false,
+  keep_alive: "30m",
+  options: { num_batch: config.embeddings.numBatch },
+} as const;
 
 // Sanitize text for embedding - remove problematic characters
 function sanitizeText(text: string): string {
@@ -335,6 +349,37 @@ export async function checkEmbeddingModel(): Promise<boolean> {
   }
 }
 
+// The num_batch the embedding model pins as a model parameter, or null when it
+// pins none. A request that sends no num_batch resolves to this value, so it
+// decides whether every client of a shared Ollama lands on one runner.
+//
+// Ollama keeps one runner per model file and restarts it for a request asking
+// for a different num_batch, but only once the loaded runner is idle. Unpinned,
+// a client that sends default options (an older mindmeld, a script, curl) loads
+// a runner with a 2048 batch, and while it keeps that runner busy every request
+// for config.embeddings.numBatch waits: the backfill until OLLAMA_TIMEOUT_MS,
+// and query embeddings until the interactive deadline, so every search comes
+// back full-text only (#245). Read-only: this reports the pin, it never sets it.
+export async function embeddingModelBatch(): Promise<number | null> {
+  const response = await fetch(`${config.ollama.url}/api/show`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: config.embeddings.model }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`/api/show ${config.embeddings.model}: HTTP ${response.status}`);
+  }
+  const { parameters } = (await response.json()) as { parameters?: string };
+  const match = parameters?.match(/^num_batch\s+(\d+)\s*$/m);
+  return match ? Number(match[1]) : null;
+}
+
+// The fix for an unpinned or mismatched embedding batch, as a Modelfile.
+export const batchPinModelfile = (): string =>
+  `FROM ${config.embeddings.model}\nPARAMETER num_batch ${config.embeddings.numBatch}`;
+
 // Pull embedding model if not available
 export async function ensureEmbeddingModel(): Promise<void> {
   const isAvailable = await checkEmbeddingModel();
@@ -344,5 +389,16 @@ export async function ensureEmbeddingModel(): Promise<void> {
     const ollama = getOllamaClient();
     await ollama.pull({ model: config.embeddings.model });
     console.log("Model pulled successfully");
+  }
+
+  // A warning, not a failure: mindmeld still works with an unpinned model, as
+  // long as no other client loads it with a different batch.
+  const pinned = await embeddingModelBatch().catch(() => undefined);
+  if (pinned !== undefined && pinned !== config.embeddings.numBatch) {
+    console.warn(
+      `${config.embeddings.model} pins num_batch ${pinned ?? "none"}, but mindmeld asks for ${config.embeddings.numBatch}. ` +
+        `Any client that sends default options can then hold a runner mindmeld's embeds must wait for. ` +
+        `Pin it on the Ollama host: ollama create ${config.embeddings.model} -f <file containing: ${batchPinModelfile().replace("\n", " / ")}>`,
+    );
   }
 }
