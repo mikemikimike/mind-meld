@@ -1,5 +1,6 @@
 import assert from 'node:assert'
 import { config } from '../config.js'
+import { embeddingModelBatch, batchPinModelfile } from '../embeddings/ollama.js'
 import { query } from '../db/postgres.js'
 import { findAutomatedDrift } from '../embeddings/automated-flags.js'
 import { notWarmup } from './title.js'
@@ -71,7 +72,12 @@ export type HealthMetrics = {
   // sync sets those. `unexplained` is flagged by a rule this process does not
   // hold; only scripts/backfill-automated.ts clears those, on purpose.
   automatedFlagDrift: { unflagged: number; unexplained: number }
+  embeddingBatch: EmbeddingBatchHealth
 }
+
+// The num_batch mindmeld sends on every embed, and the one the embedding model
+// pins (null: pins none), or why Ollama could not be asked.
+type EmbeddingBatchHealth = { wanted: number } & ({ pinned: number | null } | { error: string })
 
 const gatherCoverage = async () => {
   const result = await query<{
@@ -178,7 +184,19 @@ const gatherEmbeddingHealth = async () => {
   }
 }
 
+// Whether the embedding model pins the num_batch mindmeld asks for (#245). Never
+// throws: the rest of the report is database-only and must still arrive.
+const gatherEmbeddingBatch = async (): Promise<EmbeddingBatchHealth> => {
+  const wanted = config.embeddings.numBatch
+  try {
+    return { wanted, pinned: await embeddingModelBatch() }
+  } catch (error) {
+    return { wanted, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export const getHealth = async (): Promise<HealthMetrics> => {
+  const embeddingBatch = gatherEmbeddingBatch()
   const coverage = await gatherCoverage()
   const bad = await gatherBadSummaries()
   const embeddings = await gatherEmbeddingHealth()
@@ -199,6 +217,7 @@ export const getHealth = async (): Promise<HealthMetrics> => {
       unflagged: drift.filter((d) => !d.stored).length,
       unexplained: drift.filter((d) => d.stored).length,
     },
+    embeddingBatch: await embeddingBatch,
   }
 }
 
@@ -208,6 +227,24 @@ const formatAge = (seconds: number | null): string => {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
   return `${Math.floor(seconds / 86400)}d ago`
+}
+
+const formatEmbeddingBatch = (b: EmbeddingBatchHealth): string => {
+  if ('error' in b) {
+    return `## Embedding Batch: UNKNOWN
+- Could not read ${config.embeddings.model} from Ollama: ${b.error}`
+  }
+  if (b.pinned === b.wanted) {
+    return `## Embedding Batch: HEALTHY
+- ${config.embeddings.model} pins num_batch ${b.pinned}, the batch mindmeld asks for`
+  }
+  return `## Embedding Batch: UNHEALTHY
+- mindmeld asks for num_batch ${b.wanted}; ${config.embeddings.model} pins ${b.pinned ?? 'none (Ollama default)'}
+- Any client that sends default options loads a runner with another batch, and
+  Ollama swaps a runner only when it is idle: while that client keeps it busy,
+  backfill embeds and search query embeddings wait (searches return full text only).
+- Fix, on the Ollama host: \`ollama create ${config.embeddings.model} -f <file>\` with
+${batchPinModelfile().split('\n').map((line) => `      ${line}`).join('\n')}`
 }
 
 export const formatHealth = (h: HealthMetrics): string => {
@@ -236,6 +273,8 @@ ${badBreakdown || '  - (none)'}
 ## Automated Flags: ${h.automatedFlagDrift.unflagged + h.automatedFlagDrift.unexplained === 0 ? 'HEALTHY' : 'UNHEALTHY'} (both should be 0)
 - Should be flagged and is not: ${h.automatedFlagDrift.unflagged}
 - Flagged, and this process's rule does not explain it: ${h.automatedFlagDrift.unexplained}
+
+${formatEmbeddingBatch(h.embeddingBatch)}
 
 ---
 

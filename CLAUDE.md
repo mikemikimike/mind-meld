@@ -255,6 +255,15 @@ duplicate work comes straight off it.
   `docker-compose.yml` long after the docs said it was gone, and cost debugging
   time as a suspect. If an old `.env` or systemd unit still sets it, it is
   ignored; it cannot cause an embedding problem.
+- **A query embed that times out with "aborted due to timeout" is not the
+  in-process gate.** A search stuck in `withOllamaGate` fails with
+  `No Ollama slot free within ...ms`. If the message is the timeout one, the
+  slot was acquired and Ollama itself did not answer. The cause seen so far is a
+  bge-m3 runner loaded with another `num_batch` by a different client (#245):
+  `health` shows **Embedding Batch: UNHEALTHY**, and the fix is pinning
+  `num_batch` on the model (docs/MULTI-MACHINE.md, "one bge-m3 runner"). To
+  confirm, time the same `/api/embed` straight at Ollama with and without
+  `"options":{"num_batch":8192}`: one answers in milliseconds, the other hangs.
 - Stack traces distinguish the workers: `/$bunfs/root/mindmeld` is the
   Bun-compiled `sync` image, `/app/src/...` is the tsx-based `mcp` image. Both
   appearing for one session is proof of concurrent duplicate work.
