@@ -10,6 +10,7 @@ import {
   getOllamaClient,
   generateEmbeddings,
   ensureEmbeddingModel,
+  embeddingModelBatch,
 } from "./ollama.js";
 import { config } from "../config.js";
 
@@ -320,7 +321,31 @@ describe("the background client", () => {
     await ensureEmbeddingModel();
     models = [{ name: `${config.embeddings.model}:latest` }];
     await ensureEmbeddingModel();
-    expect(fetch.mock.calls.map(([url]) => new URL(url).pathname)).toEqual(["/api/tags", "/api/pull", "/api/tags"]);
+    expect(fetch.mock.calls.map(([url]) => new URL(url).pathname)).toEqual([
+      "/api/tags", "/api/pull", "/api/show",
+      "/api/tags", "/api/show",
+    ]);
+  });
+
+  // #245: the warning names the condition that starves mindmeld's embeds.
+  it("warns at startup when the model does not pin mindmeld's batch, and only then", async () => {
+    let parameters = "num_ctx 8192";
+    vi.stubGlobal("fetch", async (input: string) =>
+      input.endsWith("/api/tags")
+        ? Response.json({ models: [{ name: `${config.embeddings.model}:latest` }] })
+        : Response.json({ parameters }),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await ensureEmbeddingModel();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain(`PARAMETER num_batch ${config.embeddings.numBatch}`);
+      parameters = `num_batch ${config.embeddings.numBatch}`;
+      await ensureEmbeddingModel();
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("surfaces an unreachable Ollama at startup", async () => {
@@ -411,5 +436,48 @@ describe("embedding a batch bge-m3 refuses part of", () => {
 
   it("refuses a text that is empty once cleaned", async () => {
     await expect(generateEmbeddings(["fine", "\u0000"])).rejects.toThrow("index 1 is empty");
+  });
+});
+
+// Ollama keeps one runner per model file and restarts it for a request that asks
+// for another num_batch, but only once the loaded runner is idle. So a client that
+// sends default options while it keeps bge-m3 busy starves every request that asks
+// for config.embeddings.numBatch, query embeddings included (#245). The model's own
+// num_batch parameter is what a default request resolves to, so it decides whether
+// every client lands on one runner.
+describe("embeddingModelBatch", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const showReturns = (body: object, status = 200) => {
+    const asked: { url: string; body: unknown }[] = [];
+    vi.stubGlobal("fetch", async (input: unknown, init: RequestInit) => {
+      asked.push({ url: String(input), body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify(body), { status });
+    });
+    return asked;
+  };
+
+  it("reads the num_batch the model pins from /api/show", async () => {
+    const asked = showReturns({ parameters: "num_ctx                        8192\nnum_batch                      8192" });
+    await expect(embeddingModelBatch()).resolves.toBe(8192);
+    expect(asked[0].url).toBe(`${config.ollama.url}/api/show`);
+    expect(asked[0].body).toEqual({ model: config.embeddings.model });
+  });
+
+  it("is null when the model pins parameters but not num_batch", async () => {
+    showReturns({ parameters: "num_ctx                        8192" });
+    await expect(embeddingModelBatch()).resolves.toBeNull();
+  });
+
+  it("is null when the model pins no parameters at all, as a plain pull does", async () => {
+    showReturns({ modelfile: "FROM bge-m3" });
+    await expect(embeddingModelBatch()).resolves.toBeNull();
+  });
+
+  it("fails when Ollama does not know the model", async () => {
+    showReturns({ error: "model 'bge-m3' not found" }, 404);
+    await expect(embeddingModelBatch()).rejects.toThrow("404");
   });
 });

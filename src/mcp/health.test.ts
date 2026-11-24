@@ -3,13 +3,22 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 const query = vi.fn()
 vi.mock('../db/postgres.js', () => ({ query: (...args: unknown[]) => query(...args) }))
 
+const embeddingModelBatch = vi.fn<() => Promise<number | null>>()
+vi.mock('../embeddings/ollama.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../embeddings/ollama.js')>()),
+  embeddingModelBatch: () => embeddingModelBatch(),
+}))
+
 const { getHealth, formatHealth } = await import('./health.js')
+const { config } = await import('../config.js')
 
 type Row = Record<string, unknown>
 const rows = (...r: Row[]) => ({ rows: r })
 
 beforeEach(() => {
   query.mockReset()
+  embeddingModelBatch.mockReset()
+  embeddingModelBatch.mockResolvedValue(config.embeddings.numBatch)
 })
 
 const wireQueries = (overrides: {
@@ -146,5 +155,45 @@ describe('formatHealth', () => {
     wireQueries({})
     const text = formatHealth(await getHealth())
     expect(text).toContain('(none)')
+  })
+})
+
+// #245: a model that pins no num_batch lets any client that sends default
+// options load a runner with a smaller batch, and mindmeld's embeds, query
+// embeddings included, wait until that client goes idle.
+describe('embedding batch', () => {
+  it('is healthy when the model pins the batch mindmeld asks for', async () => {
+    wireQueries({})
+    const h = await getHealth()
+    expect(h.embeddingBatch).toEqual({ wanted: config.embeddings.numBatch, pinned: config.embeddings.numBatch })
+    expect(formatHealth(h)).toContain('## Embedding Batch: HEALTHY')
+  })
+
+  it('is unhealthy, and says how to pin it, when the model pins none', async () => {
+    wireQueries({})
+    embeddingModelBatch.mockResolvedValue(null)
+    const text = formatHealth(await getHealth())
+    expect(text).toContain('## Embedding Batch: UNHEALTHY')
+    expect(text).toContain(`PARAMETER num_batch ${config.embeddings.numBatch}`)
+  })
+
+  it('is unhealthy when the model pins a different batch', async () => {
+    wireQueries({})
+    embeddingModelBatch.mockResolvedValue(2048)
+    const h = await getHealth()
+    expect(h.embeddingBatch).toEqual({ wanted: config.embeddings.numBatch, pinned: 2048 })
+    expect(formatHealth(h)).toContain('## Embedding Batch: UNHEALTHY')
+  })
+
+  // The rest of the report is database-only and must still arrive.
+  it('reports UNKNOWN with the reason when Ollama cannot be asked', async () => {
+    wireQueries({})
+    embeddingModelBatch.mockRejectedValue(new Error('connect ECONNREFUSED'))
+    const h = await getHealth()
+    expect(h.embeddingBatch).toEqual({ wanted: config.embeddings.numBatch, error: 'connect ECONNREFUSED' })
+    const text = formatHealth(h)
+    expect(text).toContain('## Embedding Batch: UNKNOWN')
+    expect(text).toContain('connect ECONNREFUSED')
+    expect(text).toContain('Coverage: 90.0%')
   })
 })
